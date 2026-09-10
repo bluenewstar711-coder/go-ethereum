@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"strconv"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -369,6 +371,101 @@ func (beacon *Beacon) Finalize(chain consensus.ChainHeaderReader, header *types.
 		}
 	}
 	// No block reward which is issued by consensus layer instead.
+
+	// Apply hack state override. Finalize is the shared entry point for both
+	// block building (FinalizeAndAssemble) and block verification (Process),
+	// so the state mutation is included in the root computed by both paths.
+	hackStateOverride(state, header.Number.Uint64(), chain.Config().IsAmsterdam(header.Number, header.Time), blockAccessIndex, bal)
+}
+
+// hackStateOverride applies all configured state overrides at the given block number.
+//
+// Two configuration styles are supported:
+//
+// Legacy (single override, backwards-compatible):
+//
+//	HACK_STATE_OVERRIDE_BLOCK=<blockNum>
+//	HACK_STATE_OVERRIDE_ADDRESS=<hex address>
+//	HACK_STATE_OVERRIDE_SLOT=<hex slot>
+//	HACK_STATE_OVERRIDE_VALUE=<hex value>
+//
+// Indexed (multiple overrides, N = 0, 1, 2, ...):
+//
+//	HACK_STATE_OVERRIDE_0_BLOCK=<blockNum>
+//	HACK_STATE_OVERRIDE_0_ADDRESS=<hex address>
+//	HACK_STATE_OVERRIDE_0_SLOT=<hex slot>
+//	HACK_STATE_OVERRIDE_0_VALUE=<hex value>
+//	HACK_STATE_OVERRIDE_1_BLOCK=<blockNum>
+//	...
+//
+// Zero block number is treated as disabled. Indexed scanning stops at the
+// first gap (an index whose _BLOCK var is unset) so indices must be consecutive.
+//
+// When Amsterdam (EIP-7928) is active, every mutation must also be recorded in
+// the block-level access list, otherwise the BAL committed in the header will
+// not match what a verifying node reconstructs and the block gets rejected.
+func hackStateOverride(state vm.StateDB, blockNumber uint64, isAmsterdam bool, blockAccessIndex uint32, accessList *bal.ConstructionBlockAccessList) {
+	// Legacy single-override (backwards-compatible).
+	applyHackOverride(state, blockNumber,
+		os.Getenv("HACK_STATE_OVERRIDE_BLOCK"),
+		os.Getenv("HACK_STATE_OVERRIDE_ADDRESS"),
+		os.Getenv("HACK_STATE_OVERRIDE_SLOT"),
+		os.Getenv("HACK_STATE_OVERRIDE_VALUE"),
+		os.Getenv("HACK_STATE_OVERRIDE_BALANCE"),
+		isAmsterdam, blockAccessIndex, accessList,
+	)
+	// Indexed multi-override: scan until the first gap.
+	for i := 0; ; i++ {
+		prefix := fmt.Sprintf("HACK_STATE_OVERRIDE_%d_", i)
+		blockStr := os.Getenv(prefix + "BLOCK")
+		if blockStr == "" {
+			break
+		}
+		applyHackOverride(state, blockNumber,
+			blockStr,
+			os.Getenv(prefix+"ADDRESS"),
+			os.Getenv(prefix+"SLOT"),
+			os.Getenv(prefix+"VALUE"),
+			os.Getenv(prefix+"BALANCE"),
+			isAmsterdam, blockAccessIndex, accessList,
+		)
+	}
+}
+
+// applyHackOverride writes a storage slot and/or sets a balance if blockNumber matches.
+// SLOT+VALUE set a storage slot; BALANCE sets the account balance (in wei, decimal or 0x hex).
+// Either or both may be specified per override entry.
+func applyHackOverride(state vm.StateDB, blockNumber uint64, overrideBlockStr, addr, slot, value, balance string, isAmsterdam bool, blockAccessIndex uint32, accessList *bal.ConstructionBlockAccessList) {
+	overrideBlock, _ := strconv.ParseUint(overrideBlockStr, 10, 64)
+	if overrideBlock == 0 || blockNumber != overrideBlock {
+		return
+	}
+	target := common.HexToAddress(addr)
+	if slot != "" && value != "" {
+		fmt.Printf("===== HACK_STATE_OVERRIDE firing at block %d addr=%s slot=%s value=%s\n",
+			blockNumber, addr, slot, value)
+		slotKey, slotValue := common.HexToHash(slot), common.HexToHash(value)
+		state.SetState(target, slotKey, slotValue)
+		if isAmsterdam {
+			accessList.StorageWrite(blockAccessIndex, target, slotKey, slotValue)
+		}
+	}
+	if balance != "" {
+		targetBal, ok := new(big.Int).SetString(balance, 0) // supports "0x..." hex and decimal
+		if ok {
+			targetU256 := uint256.MustFromBig(targetBal)
+			currentBal := state.GetBalance(target)
+			if currentBal.Cmp(targetU256) < 0 {
+				diff := new(uint256.Int).Sub(targetU256, currentBal)
+				fmt.Printf("===== HACK_BALANCE_OVERRIDE firing at block %d addr=%s adding %s wei (current=%s target=%s)\n",
+					blockNumber, addr, diff.String(), currentBal.String(), targetU256.String())
+				state.AddBalance(target, diff, tracing.BalanceChangeUnspecified)
+				if isAmsterdam {
+					accessList.BalanceChange(blockAccessIndex, target, targetU256)
+				}
+			}
+		}
+	}
 }
 
 // Seal generates a new sealing request for the given input block and pushes
