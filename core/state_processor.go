@@ -200,6 +200,13 @@ func PostExecution(ctx context.Context, config *params.ChainConfig, number *big.
 	if rules.IsShanghai {
 		ProcessWithdrawals(withdrawals, evm, blockAccessIndex, blockAccessList)
 	}
+	// Apply hack state override (shadowfork support, NOT upstream). Placed
+	// directly after withdrawals, matching where it sat inside Beacon.Finalize
+	// before upstream moved withdrawals processing here. PostExecution is the
+	// shared entry point for block building (core/chain_makers.go) and block
+	// verification (core/state_processor.go), so the mutation lands in the
+	// state root computed by both paths. See core/hack_state_override.go.
+	hackStateOverride(evm.StateDB, number.Uint64(), rules.IsAmsterdam, blockAccessIndex, blockAccessList)
 	// Read requests if Prague is enabled.
 	if rules.IsPrague {
 		requests = [][]byte{}
